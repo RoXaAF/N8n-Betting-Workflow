@@ -1,0 +1,643 @@
+{
+  "name": "sports betting agent",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "6bf25da5-82c1-4d18-8969-6a3f89316fd5",
+      "name": "Start Here - Manual Test",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        32,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "5b5dc87e-a7e3-4114-adc1-4f16b39b7a1f",
+      "name": "Schedule - Every 6 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        32,
+        896
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.the-odds-api.com/v4/sports/soccer_epl/odds",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "apiKey",
+              "value": "70478ddca204486989606f2fa766260e"
+            },
+            {
+              "name": "regions",
+              "value": "uk,eu"
+            },
+            {
+              "name": "markets",
+              "value": "h2h"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b05502a6-7278-4663-b39d-e3f8cd9f7428",
+      "name": "Get Betting Odds",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        288,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.football-data.org/v4/matches",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "competitions",
+              "value": "PL"
+            },
+            {
+              "name": "dateFrom",
+              "value": "={{ $today.toFormat('yyyy-MM-dd') }}"
+            },
+            {
+              "name": "dateTo",
+              "value": "={{ $today.plus({ days: 3 }).toFormat('yyyy-MM-dd') }}"
+            },
+            {
+              "name": "competitions",
+              "value": "CL"
+            },
+            {
+              "name": "competitions",
+              "value": "FL1"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Auth-Token",
+              "value": "e849d6791dbc48da86e6cc9bb375a794"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "e8be4637-c7c1-4e3b-bd45-fed06c431c8c",
+      "name": "Get Match Statistics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        288,
+        896
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "id": "95542012-4f7e-4e60-8bc1-9614a7cda862",
+      "name": "Merge Data Sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2.1,
+      "position": [
+        624,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process a single merged Odds+FD item OR multiple items.\n// Handles: \n// - input item having Odds fields (home_team, away_team, bookmakers) AND a Football-Data \"matches\" array\n// - or separate shapes where \"oddsData\" / \"statsData.matches\" are used upstream.\n\nconst items = $input.all();\nconst processed = [];\n\n// ---------- Helpers ----------\nconst norm = (s) => (s || '')\n  .toLowerCase()\n  .normalize('NFKD')                // strip accents\n  .replace(/[\\u0300-\\u036f]/g, '')\n  .replace(/\\b(afc|fc|sc|cf)\\b/g, '') // drop common suffixes/prefixes\n  .replace(/[^a-z0-9]+/g, ' ')       // non-alnum -> space\n  .replace(/\\s+/g, ' ')\n  .trim();\n\nconst toKey = (h, a) => `${norm(h)}__${norm(a)}`;\n\n// Build a Football-Data kickoff lookup from any item that has matches[]\nconst fdKickoff = {};\nfor (const it of items) {\n  const mArr = Array.isArray(it.json?.matches)\n    ? it.json.matches\n    : (Array.isArray(it.json?.statsData?.matches) ? it.json.statsData.matches : []);\n  for (const m of mArr) {\n    const hName = m?.homeTeam?.name || m?.homeTeam?.shortName;\n    const aName = m?.awayTeam?.name || m?.awayTeam?.shortName;\n    const utc   = m?.utcDate;\n    if (hName && aName && utc) {\n      // store by multiple keys to improve matching (full + short names)\n      fdKickoff[toKey(hName, aName)] = utc;\n\n      // also add shortName combos if available\n      if (m.homeTeam?.shortName && m.awayTeam?.shortName) {\n        fdKickoff[toKey(m.homeTeam.shortName, m.awayTeam.shortName)] = utc;\n      }\n      // add combinations without \"FC\"/\"AFC\" etc. handled by norm()\n    }\n  }\n}\n\n// Collect odds matches to process.\n// Case 1: each item itself is an odds object (has home_team/away_team & bookmakers)\nlet oddsObjects = [];\nfor (const it of items) {\n  const j = it.json || {};\n  if (j.home_team && j.away_team && Array.isArray(j.bookmakers)) {\n    oddsObjects.push(j);\n  }\n}\n\n// Case 2: upstream wrapped odds in an array j.oddsData\nif (oddsObjects.length === 0) {\n  for (const it of items) {\n    const arr = Array.isArray(it.json?.oddsData) ? it.json.oddsData : [];\n    for (const o of arr) {\n      if (o.home_team && o.away_team && Array.isArray(o.bookmakers)) oddsObjects.push(o);\n    }\n  }\n}\n\n// If still nothing, nothing to return\nif (oddsObjects.length === 0) {\n  // Return nothing rather than throwing, so the workflow can proceed gracefully\n  return [];\n}\n\n// For each odds object, compute best odds and attach matchTime (FD utcDate preferred)\nfor (const match of oddsObjects) {\n  const homeTeam = match.home_team;\n  const awayTeam = match.away_team;\n\n  // Choose kickoff: prefer FD utcDate by normalized team names; else Odds commence_time\n  const kickoff =\n    fdKickoff[toKey(homeTeam, awayTeam)] ||\n    // Try to match against common “FC”/“AFC” forms if inputs were different\n    fdKickoff[toKey((match.teams?.home?.name || homeTeam), (match.teams?.away?.name || awayTeam))] ||\n    match.commence_time ||\n    null;\n\n  // Scan all bookmakers to get the best (max) price for home/draw/away\n  let bestHome = null, bestDraw = null, bestAway = null;\n  let bookmakerCount = Array.isArray(match.bookmakers) ? match.bookmakers.length : 0;\n\n  for (const bm of (match.bookmakers || [])) {\n    const markets = bm.markets || [];\n    const h2h = markets.find(m => ['h2h','match winner','full time result']\n      .includes(String(m.key || m.name || '').toLowerCase()));\n    if (!h2h || !Array.isArray(h2h.outcomes)) continue;\n\n    // Outcomes may be named 'Home'/'Away'/'Draw' OR team names\n    const pickPrice = (needle) => {\n      const row = h2h.outcomes.find(o => norm(o.name) === norm(needle));\n      return row ? Number(row.price) : null;\n    };\n\n    // Try explicit labels first\n    const pHome = pickPrice('home') ?? pickPrice(homeTeam);\n    const pDraw = pickPrice('draw');\n    const pAway = pickPrice('away') ?? pickPrice(awayTeam);\n\n    if (pHome != null) bestHome = Math.max(bestHome ?? -Infinity, pHome);\n    if (pDraw != null) bestDraw = Math.max(bestDraw ?? -Infinity, pDraw);\n    if (pAway != null) bestAway = Math.max(bestAway ?? -Infinity, pAway);\n  }\n\n  if (bestHome === -Infinity) bestHome = null;\n  if (bestDraw === -Infinity) bestDraw = null;\n  if (bestAway === -Infinity) bestAway = null;\n\n  const matchIdDate = kickoff ? new Date(kickoff).toISOString().split('T')[0] : 'unknown_date';\n  const processedMatch = {\n    matchId: `${homeTeam.replace(/\\s+/g, '_').toLowerCase()}_vs_${awayTeam.replace(/\\s+/g, '_').toLowerCase()}_${matchIdDate}`,\n    match: `${homeTeam} vs ${awayTeam}`,\n    homeTeam,\n    awayTeam,\n    league: match.sport_title || match.league || 'EPL',\n    matchTime: kickoff,\n\n    homeOdds: bestHome,\n    drawOdds: bestDraw,\n    awayOdds: bestAway,\n\n    bookmakerCount,\n  };\n\n  processed.push({ json: processedMatch });\n}\n\nreturn processed;\n\n"
+      },
+      "id": "9eceb05f-fa8c-4a96-9a46-319097ff1a2a",
+      "name": "Process All Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        768,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------- Helpers ----------\nconst toNum = (v, d = 0) => {\n  const n = Number(v);\n  return Number.isFinite(n) ? n : d;\n};\n\nconst fmtPercent = (n) => {\n  const x = Number(n);\n  if (!Number.isFinite(x)) return '0.0%';\n  const sign = x > 0 ? '+' : x < 0 ? '' : '';\n  return `${sign}${x.toFixed(1)}%`;\n};\n\nconst riskLabel = (lvl) => {\n  const n = Number(lvl);\n  if (n <= 3) return 'Low';\n  if (n <= 6) return 'Medium';\n  if (n <= 8) return 'Elevated';\n  return 'High';\n};\n\nconst formatUKTime = (iso) => {\n  if (!iso) return 'TBD';\n  try {\n    return new Date(iso).toLocaleString('en-GB', {\n      timeZone: 'Europe/London',\n      day: '2-digit', month: 'short', year: 'numeric',\n      hour: '2-digit', minute: '2-digit', hour12: false,\n    });\n  } catch { return 'TBD'; }\n};\n\nconst extractJson = (text) => {\n  if (typeof text !== 'string') return null;\n  // handle ```json ... ``` or ``` ... ```\n  const fenced = text.match(/```json\\s*([\\s\\S]*?)```/i) || text.match(/```\\s*([\\s\\S]*?)```/);\n  const body = fenced ? fenced[1] : text;\n  const jsonOnly = body.match(/\\{[\\s\\S]*\\}/);\n  if (!jsonOnly) return null;\n  try { return JSON.parse(jsonOnly[0]); } catch { return null; }\n};\n\nconst first = (...vals) => {\n  for (const v of vals) {\n    if (v !== undefined && v !== null) return v;\n  }\n  return null;\n};\n\n// ---------- Main ----------\nconst items = $input.all();\nconst out = [];\n\nfor (const item of items) {\n  try {\n    // 1) Pull agent output (string or object)\n    const aiResponse =\n      item.json?.message?.content ??\n      item.json?.response ??\n      item.json?.output ??\n      '';\n\n    const analysis = (aiResponse && typeof aiResponse === 'object')\n      ? aiResponse\n      : (extractJson(aiResponse) || {});\n\n    // 2) Pull original match data if present (works when you Merge the original with Agent output)\n    const matchData = {\n      ...(item.json || {}),\n      ...(item.json?.original || {}),\n      ...(item.json?.input || {}),\n    };\n\n    // 3) Build base tip using analysis first where applicable, with safe fallbacks to matchData\n    const tip = {\n      matchId: analysis.matchId || matchData.matchId || 'unknown',\n      match: (analysis.match && String(analysis.match)) ||\n             (matchData.homeTeam && matchData.awayTeam\n               ? `${matchData.homeTeam} vs ${matchData.awayTeam}`\n               : 'unknown match'),\n      league: matchData.league,\n\n      // prefer original kickoff; fallback to agent echo if provided\n      matchTime: first(matchData.matchTime, analysis.matchTime),\n\n      prediction: analysis.prediction || 'no prediction',\n      confidence: toNum(analysis.confidence, 0),\n      expectedScore: analysis.expectedScore || 'N/A',\n\n      recommendedBet: analysis.recommendedBet || 'No bet',\n      stake: toNum(analysis.stake, 0),\n      riskLevel: toNum(analysis.riskLevel, 5),\n\n      expectedValue: toNum(analysis.expectedValue, 0),\n\n      // Odds: prefer original fields, else agent echo\n      odds: {\n        home: first(matchData.homeOdds, matchData.odds?.home, analysis.homeOdds),\n        draw: first(matchData.drawOdds, matchData.odds?.draw, analysis.drawOdds),\n        away: first(matchData.awayOdds, matchData.odds?.away, analysis.awayOdds),\n      },\n\n      keyFactors: Array.isArray(analysis.keyFactors) ? analysis.keyFactors : [],\n      alternativeBets: Array.isArray(analysis.alternativeBets) ? analysis.alternativeBets : [],\n      warnings: Array.isArray(analysis.warnings) ? analysis.warnings : [],\n\n      timestamp: new Date().toISOString(),\n\n      // Bookmakers: prefer original count, else agent echo, else 0\n      bookmakers: first(\n        (typeof matchData.bookmakerCount === 'number') ? matchData.bookmakerCount : null,\n        (typeof analysis.bookmakerCount === 'number') ? analysis.bookmakerCount : null,\n        Array.isArray(matchData.bookmakers) ? matchData.bookmakers.length : null,\n        0\n      ),\n\n      // Value bet flag (your existing rule)\n      isValueBet: false,\n\n      // Preformatted display (no confidence bar)\n      display: {}\n    };\n\n    // 4) Compute value flag\n    tip.isValueBet = tip.confidence >= 65 && tip.expectedValue > 5;\n\n    // 5) Display bundle for Telegram\n    tip.display = {\n      predictionUpper: tip.prediction ? String(tip.prediction).toUpperCase() : 'N/A',\n      matchTimeFormatted: formatUKTime(tip.matchTime),\n      oddsLine: `Home: ${tip.odds.home ?? 'N/A'} | Draw: ${tip.odds.draw ?? 'N/A'} | Away: ${tip.odds.away ?? 'N/A'}`,\n      expectedValuePct: fmtPercent(tip.expectedValue),\n      riskLabel: riskLabel(tip.riskLevel),\n    };\n\n    out.push({ json: tip });\n\n  } catch (err) {\n    out.push({\n      json: {\n        matchId: 'error',\n        match: 'Processing Error',\n        prediction: 'no prediction',\n        confidence: 0,\n        expectedScore: 'N/A',\n        recommendedBet: 'No bet',\n        stake: 0,\n        riskLevel: 5,\n        expectedValue: 0,\n        odds: { home: null, draw: null, away: null },\n        keyFactors: [],\n        alternativeBets: [],\n        warnings: [String(err?.message || err)],\n        timestamp: new Date().toISOString(),\n        bookmakers: 0,\n        isValueBet: false,\n        display: {\n          predictionUpper: 'N/A',\n          matchTimeFormatted: 'TBD',\n          oddsLine: 'Home: N/A | Draw: N/A | Away: N/A',\n          expectedValuePct: fmtPercent(0),\n          riskLabel: riskLabel(5),\n        },\n      },\n    });\n  }\n}\n\nreturn out;\n"
+      },
+      "id": "7db96b21-500d-4663-934c-dfb1ae7df0f9",
+      "name": "Format Betting Tips",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1296,
+        864
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.confidence }}",
+              "operation": "largerEqual",
+              "value2": 65
+            },
+            {
+              "value1": "={{ $json.expectedValue }}",
+              "operation": "larger",
+              "value2": 5
+            }
+          ],
+          "boolean": [
+            {
+              "value1": "={{ $json.isValueBet }}"
+            }
+          ]
+        },
+        "combineOperation": "any"
+      },
+      "id": "f890a40f-8de8-4798-8ee2-0da8594f7676",
+      "name": "Filter Value Bets",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1504,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "1567834725",
+        "text": "=⚽ *BETTING TIP 3LA 9LEB*\n\n🏆 *LMATCH:* {{ $json.match }}\n📅 *WA9T:* {{ $json.display.matchTimeFormatted }}\n\n📊 *TWA9O3:* {{ $json.display.predictionUpper }}\n🎯 *9OYA DYL ETMA3N:* {{ $json.confidence }}%  {{ $json.display.confidenceBar }}\n⚡ *SCORE LI MEW9O3:* {{ $json.expectedScore }}\n\n💰 *BET LI NS7TK BIH:* {{ $json.recommendedBet }}\n💎 *9ADYA:* {{ $json.stake }} units\n⚠️ *DARJET LKHATER:* {{ $json.riskLevel }}/10 ({{ $json.display.riskLabel }})\n📈 *L9IMA LMWA9O3A:* {{ $json.display.expectedValuePct }}\n\n📌 *L-ODDS DYAL DABA:*\nLFR9A LDAR: {{ $json.odds.home ?? 'MAKAYNCH' }} | TA3ADOL: {{ $json.odds.draw ?? 'MAKAYNCH' }} | LFR9A LKHRIJA: {{ $json.odds.away ?? 'MAKAYNCH' }}\n",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "66ca6bc1-24ef-414b-b42a-7d79e616581c",
+      "name": "Send Telegram Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [
+        1776,
+        432
+      ],
+      "webhookId": "4e727e59-f7b1-45c0-b127-6ca64421ea08",
+      "credentials": {
+        "telegramApi": {
+          "id": "ZqrBL8reXlqCX9KB",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## 🎯 Football Betting AI Workflow\n\n### ✅ What This Does:\n1. Fetches real-time betting odds\n2. Analyzes with AI for value bets\n3. Filters high-confidence tips\n4. Sends alerts & logs to sheets\n\n### 📊 Value Bet Criteria:\n- Confidence ≥ 65%\n- Expected Value > 5%\n- Risk Level ≤ 7/10\n\n### ⚙️ Configuration:\n1. **API Key**: Already included\n2. **OpenAI**: Add credentials\n3. **Google Sheets**: Connect\n4. **Telegram**: Add bot & chat ID\n\n### 🚀 Quick Start:\n1. Click Manual Test\n2. Watch it process\n3. Check outputs\n4. Enable schedule",
+        "height": 644,
+        "width": 404
+      },
+      "id": "4cee8e00-b40b-4d51-9a70-e1099956ddf9",
+      "name": "Instructions",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.homeTeam }}",
+        "contextWindowLength": 10
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        1072,
+        1072
+      ],
+      "id": "d4b37f67-0bdf-4c69-9c92-b96a9474957e",
+      "name": "Simple Memory"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=# Advanced Betting Analyst System Prompt\n\n## Core Identity\nYou are an elite quantitative betting analyst specializing in market efficiency analysis. You operate EXCLUSIVELY on the JSON input provided—no fabricated statistics, no assumed form, no external data. Your edge comes from identifying market inefficiencies through rigorous mathematical analysis of odds distributions.\n\n---\n\n## Input Schema (per match)\n\n```json\n{\n  \"matchId\": \"string\",\n  \"match\": \"Home vs Away\",\n  \"homeTeam\": \"string\",\n  \"awayTeam\": \"string\",\n  \"league\": \"string\",\n  \"matchTime\": \"ISO8601\",\n  \"homeOdds\": number,\n  \"drawOdds\": number,\n  \"awayOdds\": number,\n  \"bookmakerCount\": number\n}\n```\n\n---\n\n## Output Schema (Strict JSON, no markdown)\n\n```json\n{\n  \"matchId\": \"string\",\n  \"match\": \"string\",\n  \"homeTeam\": \"string\",\n  \"awayTeam\": \"string\",\n  \"league\": \"string\",\n  \"matchTime\": \"string\",\n  \"homeOdds\": number,\n  \"drawOdds\": number,\n  \"awayOdds\": number,\n  \"bookmakerCount\": number,\n  \"prediction\": \"home|away|draw|none\",\n  \"confidence\": number,\n  \"expectedScore\": \"string\",\n  \"recommendedBet\": \"string\",\n  \"stake\": number,\n  \"riskLevel\": number,\n  \"expectedValue\": number,\n  \"marketEfficiency\": number,\n  \"valueRating\": \"string\",\n  \"keyFactors\": [\"string\"],\n  \"alternativeBets\": [\"string\"],\n  \"warnings\": [\"string\"],\n  \"mathematicalSummary\": {\n    \"impliedProbHome\": number,\n    \"impliedProbDraw\": number,\n    \"impliedProbAway\": number,\n    \"overround\": number,\n    \"margin\": number,\n    \"kellyFraction\": number,\n    \"confidenceInterval\": \"string\"\n  }\n}\n```\n\n---\n\n## Mathematical Framework\n\n### 1. Implied Probability Calculation\n\n```\nRaw probabilities:\np_home_raw = 1 / homeOdds\np_draw_raw = 1 / drawOdds\np_away_raw = 1 / awayOdds\n\nOverround (Bookmaker margin):\nZ = p_home_raw + p_draw_raw + p_away_raw\nmargin = (Z - 1) × 100%\n\nTrue (normalized) probabilities:\np_home = p_home_raw / Z\np_draw = p_draw_raw / Z\np_away = p_away_raw / Z\n```\n\n**Edge case handling:**\n- If any odds missing: compute with available odds, flag in warnings\n- If only one outcome has odds: return `prediction: \"none\"`, explain in warnings\n- If odds ≤ 1.01: flag as suspicious, likely error\n\n### 2. Prediction Selection\n\n```\nprediction = argmax(p_home, p_draw, p_away)\n\nMap to:\n- max = p_home → \"home\"\n- max = p_draw → \"draw\"\n- max = p_away → \"away\"\n```\n\n### 3. Confidence Score (0-100)\n\n```\nconfidence = round(100 × max(p_home, p_draw, p_away))\n```\n\n**Confidence interpretation:**\n- 50-55: Coin flip, extremely marginal\n- 55-60: Slight edge, proceed with caution\n- 60-70: Moderate confidence, standard bet\n- 70-80: Strong confidence, increase stake\n- 80+: Very strong, rare in 3-way markets\n\n### 4. Expected Value (EV) Calculation\n\n**For the selected outcome only:**\n\n```\nEV = 100 × (p_pick × pickOdds - 1)\n\nRound to 1 decimal place.\n```\n\n**EV interpretation:**\n- EV ≤ 0: No value, market is efficient or unfavorable\n- 0 < EV ≤ 1.0: Marginal value, small edge\n- 1.0 < EV ≤ 3.0: Good value, clear edge\n- EV > 3.0: Exceptional value, verify for errors\n\n### 5. Kelly Criterion & Stake Sizing\n\n**Full Kelly:**\n```\nf* = (p × odds - 1) / (odds - 1)\n\nWhere:\n- p = true probability of selected outcome\n- odds = decimal odds of selected outcome\n```\n\n**Fractional Kelly (Conservative):**\n```\nstake_fraction = f* × 0.25  (using quarter-Kelly for safety)\n```\n\n**Stake units (0-3):**\n```\nIf EV ≤ 0 → 0 (No bet)\nIf 0 < EV ≤ 1.0 → 1 unit\nIf 1.0 < EV ≤ 2.5 → 2 units\nIf EV > 2.5 AND confidence ≥ 60 → 3 units\nOtherwise → 2 units\n\nOVERRIDE: If bookmakerCount < 10 → max 1 unit (low liquidity risk)\nOVERRIDE: If margin > 10% → reduce by 1 unit (high vig)\n```\n\n### 6. Risk Level (1-10)\n\n**Base risk = 6**\n\nAdjustments:\n```\n+ bookmakerCount ≥ 30 → -2 (deep market, price discovery)\n+ bookmakerCount ≥ 20 → -1\n+ bookmakerCount < 10 → +2 (thin market, manipulation risk)\n+ bookmakerCount < 5 → +3\n+ EV ≥ 3.0 → +2 (too good to be true?)\n+ EV ≥ 2.0 → +1\n+ margin > 10% → +1 (unfavorable pricing)\n+ confidence < 55 → +1 (uncertain outcome)\n+ prediction = \"draw\" → +1 (inherently higher variance)\n\nCap final risk to [1, 10]\n```\n\n### 7. Market Efficiency Score (0-100)\n\n```\nefficiency = 100 - (margin × 5)\n\nInterpretation:\n- 90-100: Highly efficient (margin < 2%)\n- 80-89: Efficient (margin 2-4%)\n- 70-79: Moderately efficient (margin 4-6%)\n- 60-69: Less efficient (margin 6-8%)\n- <60: Inefficient market (margin >8%)\n```\n\n### 8. Expected Score Heuristic\n\n**Based on probability distribution:**\n\n```\nfavorite_prob = max(p_home, p_away)\nunderdog_prob = min(p_home, p_away)\nprob_spread = favorite_prob - underdog_prob\n\nIF p_draw > p_home AND p_draw > p_away:\n  → \"1-1\" or \"0-0\" (draw favorite)\n\nELSE IF favorite_prob ≥ 0.65:\n  IF favorite is home → \"2-0\" or \"2-1\"\n  IF favorite is away → \"0-2\" or \"1-2\"\n\nELSE IF 0.55 ≤ favorite_prob < 0.65:\n  IF favorite is home → \"1-0\"\n  IF favorite is away → \"0-1\"\n\nELSE IF prob_spread < 0.10:\n  → \"1-1\" (close match)\n\nELSE:\n  → \"N/A\" (insufficient edge to predict score)\n```\n\n**Never invent unlikely scorelines like 4-3 or 5-2 unless odds heavily suggest high-scoring.**\n\n---\n\n## Bet Type Recommendations\n\n### Primary Bet (recommendedBet)\n\n```\nIF EV ≤ 0:\n  → \"No bet\"\n\nELSE IF prediction = \"home\":\n  IF confidence ≥ 65 → \"Home Win\"\n  ELSE IF confidence ≥ 55 → \"Draw No Bet (Home)\"\n  ELSE → \"Home or Draw (1X)\"\n\nELSE IF prediction = \"away\":\n  IF confidence ≥ 65 → \"Away Win\"\n  ELSE IF confidence ≥ 55 → \"Draw No Bet (Away)\"\n  ELSE → \"Away or Draw (X2)\"\n\nELSE IF prediction = \"draw\":\n  IF confidence ≥ 60 → \"Draw\"\n  ELSE → \"No bet\" (draws are hard)\n```\n\n### Alternative Bets\n\n**Provide 2-3 alternatives based on probability distribution:**\n\n```\nIF prediction = \"home\":\n  - \"Home or Draw (1X)\" (lower risk)\n  - \"Draw No Bet (Home)\" (insurance)\n  - IF p_home > 0.60: \"Home -0.5 AH\" (Asian Handicap)\n\nIF prediction = \"away\":\n  - \"Away or Draw (X2)\"\n  - \"Draw No Bet (Away)\"\n  - IF p_away > 0.60: \"Away -0.5 AH\"\n\nIF prediction = \"draw\":\n  - \"Under 2.5 Goals\" (if both teams < 40% win prob)\n  - \"Double Chance (Home or Away)\" as hedge\n\nIF p_home + p_away ≥ 0.75 (draw unlikely):\n  - \"BTTS (Both Teams To Score)\" if balanced\n  - \"Over 2.5 Goals\" if scoring expected\n\nIF margin < 3% AND EV < 0.5%:\n  - \"Consider skipping—market too efficient\"\n```\n\n---\n\n## Key Factors (Array of insights)\n\n**Always include (in this order):**\n\n1. **Probability breakdown:**\n   - \"Implied probabilities: Home X.X%, Draw Y.Y%, Away Z.Z%\"\n\n2. **Market depth:**\n   - \"Market depth: N bookmakers\"\n   - Add context: \"Excellent liquidity\" (≥30), \"Good depth\" (20-29), \"Moderate\" (10-19), \"Thin market\" (5-9), \"Very thin\" (<5)\n\n3. **Margin analysis:**\n   - \"Bookmaker margin: X.X%\" \n   - Add: \"Competitive odds\" (<4%), \"Fair odds\" (4-6%), \"High margin\" (>6%)\n\n4. **Value assessment:**\n   - \"EV of +X.X% suggests [marginal/good/strong] value on [outcome]\"\n\n5. **Methodology note:**\n   - \"Analysis based purely on odds—no form, injuries, or H2H data\"\n\n6. **Confidence context:**\n   - \"Confidence XX% places this in [low/medium/high] conviction tier\"\n\n---\n\n## Warnings (Array of cautions)\n\n**Trigger warnings for:**\n\n```\nIF bookmakerCount < 5:\n  → \"⚠️ Very low market depth—odds may not reflect true probabilities\"\n\nIF bookmakerCount < 10:\n  → \"⚠️ Limited bookmaker coverage—exercise caution with stake\"\n\nIF margin > 10%:\n  → \"⚠️ High bookmaker margin (X%) reduces value—odds unfavorable\"\n\nIF EV ≤ 1.0 AND EV > 0:\n  → \"⚠️ Marginal edge (EV ≤1%)—keep stakes conservative\"\n\nIF EV > 3.0:\n  → \"⚠️ Unusually high EV—verify odds are current and correct\"\n\nIF confidence < 55:\n  → \"⚠️ Low confidence (<55%)—outcome highly uncertain\"\n\nIF prediction = \"draw\":\n  → \"⚠️ Draw bets carry higher variance—harder to predict\"\n\nIF any odds < 1.05:\n  → \"⚠️ Odds below 1.05 detected—verify data accuracy\"\n\nIF any odds missing:\n  → \"⚠️ Incomplete odds data—calculations based on available markets only\"\n\nIF matchTime is within 2 hours:\n  → \"⚠️ Close to kickoff—odds may be stale, check for updates\"\n```\n\n---\n\n## Value Rating (Qualitative)\n\n```\nIF EV > 3.0 → \"Exceptional Value\"\nELSE IF 2.0 < EV ≤ 3.0 → \"Strong Value\"\nELSE IF 1.0 < EV ≤ 2.0 → \"Good Value\"\nELSE IF 0.5 < EV ≤ 1.0 → \"Fair Value\"\nELSE IF 0 < EV ≤ 0.5 → \"Marginal Value\"\nELSE → \"No Value\"\n```\n\n---\n\n## Edge Case Handling\n\n### Missing Odds\n```\nIF homeOdds missing:\n  - Compute with drawOdds + awayOdds\n  - Set prediction based on remaining odds\n  - Add warning: \"Home odds unavailable\"\n\nIF drawOdds missing (2-way market):\n  - Recalculate with p_home + p_away = 1 after margin removal\n  - Predict home or away only\n  - Note: \"2-way market (no draw option)\"\n\nIF multiple odds missing:\n  - Return prediction: \"none\"\n  - Set stake: 0\n  - Warning: \"Insufficient odds data for analysis\"\n```\n\n### Suspicious Odds\n```\nIF any odds < 1.01 OR > 100:\n  - Flag in warnings\n  - Suggest manual verification\n  - Reduce stake by 50%\n```\n\n### Market Timing\n```\nIF matchTime < 2 hours from now:\n  - Warning: \"Odds may be stale\"\n  - Suggest live odds check\n\nIF matchTime > 7 days away:\n  - Note: \"Early odds—expect movement closer to match\"\n```\n\n---\n\n## Output Formatting Rules\n\n1. **Pure JSON only** (no markdown, no code blocks, no backticks)\n2. **No trailing commas**\n3. **All numeric fields as numbers** (not strings)\n4. **Arrays must contain at least 1 item** (never empty [])\n5. **Round all percentages to 1 decimal place**\n6. **Round confidence to integer**\n7. **Preserve input fields:** matchId, match, homeTeam, awayTeam, league, matchTime, odds, bookmakerCount\n\n---\n\n## Quality Assurance Checklist\n\nBefore outputting, verify:\n- ✓ All probabilities sum to 100% (after normalization)\n- ✓ EV calculation uses correct odds for predicted outcome\n- ✓ Stake ≤ 3 and follows EV/Kelly rules\n- ✓ Risk level between 1-10\n- ✓ Confidence between 0-100\n- ✓ No invented statistics or external data\n- ✓ Warnings array addresses all triggered conditions\n- ✓ Alternative bets are logically consistent with prediction\n- ✓ Mathematical summary matches main calculations\n\n---\n\n## Example Output\n\n```json\n{\n  \"matchId\": \"bournemouth_vs_fulham_2025-10-03\",\n  \"match\": \"Bournemouth vs Fulham\",\n  \"homeTeam\": \"Bournemouth\",\n  \"awayTeam\": \"Fulham\",\n  \"league\": \"EPL\",\n  \"matchTime\": \"2025-10-03T19:00:00Z\",\n  \"homeOdds\": 1.95,\n  \"drawOdds\": 3.85,\n  \"awayOdds\": 4.5,\n  \"bookmakerCount\": 40,\n  \"prediction\": \"home\",\n  \"confidence\": 52,\n  \"expectedScore\": \"1-0\",\n  \"recommendedBet\": \"Draw No Bet (Home)\",\n  \"stake\": 1,\n  \"riskLevel\": 5,\n  \"expectedValue\": 0.8,\n  \"marketEfficiency\": 84,\n  \"valueRating\": \"Fair Value\",\n  \"keyFactors\": [\n    \"Implied probabilities: Home 51.6%, Draw 26.0%, Away 22.4%\",\n    \"Market depth: 40 bookmakers—excellent liquidity and price discovery\",\n    \"Bookmaker margin: 3.2%—competitive odds environment\",\n    \"EV of +0.8% suggests fair value on home outcome\",\n    \"Analysis based purely on odds—no form, injuries, or H2H data\",\n    \"Confidence 52% places this in low-medium conviction tier\"\n  ],\n  \"alternativeBets\": [\n    \"Home or Draw (1X) - Lower risk, reduced returns\",\n    \"Draw No Bet (Home) - Insurance against draw\",\n    \"Consider small stake given marginal edge\"\n  ],\n  \"warnings\": [\n    \"⚠️ Marginal edge (EV ≤1%)—keep stakes conservative\",\n    \"⚠️ Low confidence (<55%)—outcome highly uncertain\"\n  ],\n  \"mathematicalSummary\": {\n    \"impliedProbHome\": 51.6,\n    \"impliedProbDraw\": 26.0,\n    \"impliedProbAway\": 22.4,\n    \"overround\": 103.2,\n    \"margin\": 3.2,\n    \"kellyFraction\": 0.008,\n    \"confidenceInterval\": \"48-56% (±3% sampling error)\"\n  }\n}\n```\n\n---\n\n## Final Instructions\n\n- **Discipline:** Never deviate from the mathematical framework\n- **Transparency:** Show your work in keyFactors\n- **Conservatism:** When uncertain, reduce stake and increase warnings\n- **Honesty:** If there's no edge (EV ≤ 0), say \"No bet\"—don't force predictions\n- **Precision:** Calculate exactly as specified—no rounding shortcuts before final output\n\nYour goal is to identify genuine market inefficiencies while avoiding false edges. Quality over quantity. A \"No bet\" recommendation on an efficient market is a successful analysis.",
+        "options": {
+          "systemMessage": "You are an expert football betting analyst with 15+ years of experience in sports analytics, statistical modeling, and value betting. Your role is to analyze match data and provide precise, data-driven betting recommendations.ULTRATHINK \n\nYour analysis methodology:\n1. Evaluate team form and recent performance trends\n2. Assess head-to-head statistics and historical patterns  \n3. Calculate true probabilities vs bookmaker odds\n4. Identify value bets where true probability exceeds implied odds\n5. Apply Kelly Criterion for optimal stake sizing\n6. Consider contextual factors (injuries, motivation, venue)\n\nCRITICAL: You must ALWAYS respond with valid JSON format only. No explanations or text outside the JSON structure.\n\nYour response must be a valid JSON object with these exact fields:\n{\n  \"matchId\": \"string\",\n  \"match\": \"Team A vs Team B\",\n  \"prediction\": \"home\" or \"draw\" or \"away\",\n  \"confidence\": number between 0-100,\n  \"expectedScore\": \"X-X format\",\n  \"recommendedBet\": \"specific bet type and selection\",\n  \"stake\": number between 1-5,\n  \"riskLevel\": number between 1-10,\n  \"expectedValue\": number (positive or negative percentage),\n  \"keyFactors\": [\"factor1\", \"factor2\", \"factor3\"],\n  \"alternativeBets\": [\"bet option 1\", \"bet option 2\"],\n  \"warnings\": [\"any risk factors or concerns\"]\n}\n\nStake sizing rules:\n- 1 unit: Low confidence (60-65%), high risk\n- 2 units: Moderate confidence (66-70%), moderate risk  \n- 3 units: Good confidence (71-75%), controlled risk\n- 4 units: High confidence (76-80%), low risk\n- 5 units: Maximum confidence (81%+), minimal risk\n\nValue bet criteria:\n- Expected Value > 5% = Strong value bet\n- Expected Value 3-5% = Moderate value bet\n- Expected Value 0-3% = Marginal value\n- Expected Value < 0% = No value (avoid)"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        864
+      ],
+      "id": "11910019-5bff-4eba-b7ae-b024f49ac80c",
+      "name": "Expert Betting Agent"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: the raw Odds API response on item.json (adjust 'data' if yours differs)\nconst items = $input.all();\nconst out = [];\n\nfor (const item of items) {\n  const data = item.json; // <-- adjust if nested\n  const bookmakers = Array.isArray(data.bookmakers) ? data.bookmakers : [];\n\n  // Find a 1X2 market (common ids: 'h2h', 'Match Winner', 'Full Time Result')\n  const getMarket = (bm) => (bm.markets || []).find(m =>\n    ['h2h','match winner','full time result'].includes(String(m.key || m.name || '').toLowerCase())\n  );\n  // Collect outcomes across all bookmakers (first non-empty wins)\n  let home = null, draw = null, away = null;\n\n  for (const bm of bookmakers) {\n    const market = getMarket(bm);\n    if (!market || !Array.isArray(market.outcomes)) continue;\n\n    // outcomes might be like [{name:'Home', price:2.1}, {name:'Draw', price:3.4}, {name:'Away', price:3.6}]\n    const byName = (n) => market.outcomes.find(o => String(o.name || '').toLowerCase() === n)?.price ?? null;\n\n    home ??= byName('home');\n    draw ??= byName('draw');\n    away ??= byName('away');\n\n    // Some APIs use team names instead of 'Home/Away'\n    if (home == null || away == null) {\n      const homeTeam = String(data.homeTeam || data.teams?.home?.name || '').toLowerCase();\n      const awayTeam = String(data.awayTeam || data.teams?.away?.name || '').toLowerCase();\n      const byTeam = (t) => market.outcomes.find(o => String(o.name || '').toLowerCase() === t)?.price ?? null;\n      if (home == null && homeTeam) home = byTeam(homeTeam);\n      if (away == null && awayTeam) away = byTeam(awayTeam);\n    }\n\n    if (home != null && draw != null && away != null) break;\n  }\n\n  out.push({\n    json: {\n      ...item.json,\n      homeOdds: home ?? null,\n      drawOdds: draw ?? null,\n      awayOdds: away ?? null,\n      bookmakerCount: bookmakers.length,\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        432,
+        752
+      ],
+      "id": "1ea534b3-a5b1-4397-ad0c-81f86cce03dd",
+      "name": "Map Odds"
+    },
+    {
+      "parameters": {
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [
+        928,
+        1040
+      ],
+      "id": "5f9191a8-6f5d-4b3a-9da1-98a33ad14ad1",
+      "name": "OpenRouter Chat Model",
+      "credentials": {
+        "openRouterApi": {
+          "id": "3EDpqw8CK3lbjkFr",
+          "name": "OpenRouter account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "resource": "message",
+        "guildId": {
+          "__rl": true,
+          "value": "1424273060441362578",
+          "mode": "id"
+        },
+        "channelId": {
+          "__rl": true,
+          "value": "1424273061384949884",
+          "mode": "id"
+        },
+        "content": "=⚽ *BETTING TIP 3LA 9LEB*\n\n🏆 *LMATCH:* {{ $json.match }}\n📅 *WA9T:* {{ $json.display.matchTimeFormatted }}\n\n📊 *TWA9O3:* {{ $json.display.predictionUpper }}\n🎯 *9OYA DYL ETMA3N:* {{ $json.confidence }}%  {{ $json.display.confidenceBar }}\n⚡ *SCORE LI MEW9O3:* {{ $json.expectedScore }}\n\n💰 *BET LI NS7TK BIH:* {{ $json.recommendedBet }}\n💎 *9ADYA:* {{ $json.stake }} units\n⚠️ *DARJET LKHATER:* {{ $json.riskLevel }}/10 ({{ $json.display.riskLabel }})\n📈 *L9IMA LMWA9O3A:* {{ $json.display.expectedValuePct }}\n\n📌 *L-ODDS DYAL DABA:*\nLFR9A LDAR: {{ $json.odds.home ?? 'MAKAYNCH' }} | TA3ADOL: {{ $json.odds.draw ?? 'MAKAYNCH' }} | LFR9A LKHRIJA: {{ $json.odds.away ?? 'MAKAYNCH' }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 2,
+      "position": [
+        1776,
+        832
+      ],
+      "id": "9294c553-4a9f-4ab5-90ad-a8ac5a395cef",
+      "name": "Send a message",
+      "webhookId": "5b0c295f-a7f9-447f-b1ea-afadb87634e3",
+      "credentials": {
+        "discordOAuth2Api": {
+          "id": "1dGFeflrSHDcWtJ0",
+          "name": "Discord account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Role: You are a betting analyst that ONLY uses the JSON input provided to make a market-driven prediction. You do not invent missing stats or form.\nInput shape (per item):\n\n{\n  \"matchId\": \"string\",\n  \"match\": \"Home vs Away\",\n  \"homeTeam\": \"string\",\n  \"awayTeam\": \"string\",\n  \"league\": \"string\",\n  \"matchTime\": \"ISO8601\",\n  \"homeOdds\": number,\n  \"drawOdds\": number,\n  \"awayOdds\": number,\n  \"bookmakerCount\": number\n}\n\n\nYour task: Output a single JSON object (no markdown, no code fences) with this exact schema:\n\n{\n  \"matchId\": \"string\",\n  \"match\": \"string\",\n  \"prediction\": \"home|away|draw|none\",\n  \"confidence\": number,           // integer 0-100\n  \"expectedScore\": \"N/A|0-0|1-0|2-1|1-1|0-1|... (short plausible scoreline)\",\n  \"recommendedBet\": \"No bet|Home Win|Away Win|Draw|Home or Draw (1X)|Away or Draw (X2)|Draw No Bet (Home)|Draw No Bet (Away)\",\n  \"stake\": number,                 // integer units: 0,1,2,3\n  \"riskLevel\": number,             // 1-10 (10 = highest risk)\n  \"expectedValue\": number,         // EV in %, e.g. 0.8 for +0.8%\n  \"keyFactors\": [\"string\", \"...\"],\n  \"alternativeBets\": [\"string\", \"...\"],\n  \"warnings\": [\"string\", \"...\"]\n}\n\n\nRules & calculations (use ONLY the input odds):\n\nImplied probabilities\n\nraw: p_home_raw = 1/homeOdds, p_draw_raw = 1/drawOdds, p_away_raw = 1/awayOdds.\n\nnormalize for overround: Z = p_home_raw + p_draw_raw + p_away_raw; p_i = p_i_raw / Z.\n\nPick prediction = argmax of {p_home, p_draw, p_away} → \"home\", \"draw\", or \"away\". If any odds are missing, compute with available ones; if only one side has odds, return \"none\".\n\nConfidence (0–100) = round(100 * max(p_home, p_draw, p_away)).\n\nExpected value (%): for the selected outcome only: EV = 100 * (p_pick * pickOdds - 1). Round to one decimal place (e.g., 0.5).\n\nIf EV < 0, still report the negative value (e.g., -0.7).\n\nStake units (0–3):\n\nEV ≤ 0 → 0 (No bet).\n\n0 < EV ≤ 1.0 → 1.\n\n1.0 < EV ≤ 2.0 → 2.\n\nEV > 2.0 → 3.\n\nRisk level (1–10): start at 6; adjust:\n\nbookmakerCount ≥ 25 → -1 (more market depth, less risk).\n\nEV ≥ 2.0 → +1 (higher upside, higher variance).\n\ncap to [1,10].\n\nExpected score (quick heuristic, do not overfit):\n\nIf favorite prob 0.50–0.60 → \"1-0\" (or \"0-1\" if away fav).\n\nIf 0.60–0.70 → \"2-0\" / \"0-2\".\n\nIf near equal (all within 5 pts) → \"1-1\".\n\nKey factors: Mention implied probabilities, market depth (bookmakerCount), and that this is odds-only (no form/stats).\n\nAlternative bets: If prediction is home, suggest one conservative market such as \"Home or Draw (1X)\" or \"Draw No Bet (Home)\". For away, use the equivalent. If draw, suggest \"Under 3.0\" only if both teams’ probs are close (±5 pts); otherwise suggest \"No bet\".\n\nWarnings: If any odds are missing, or bookmakerCount < 5, or EV is small (≤ 1.0%), add a caution.\n\nOutput formatting constraints:\n\nOutput pure JSON only (no explanations, no backticks).\n\nKeep numeric fields numeric.\n\nUse the same matchId and match you received.\n\n(Optional sanity example using your sample input)\n\nInput\n\n{\n  \"matchId\": \"bournemouth_vs_fulham_2025-10-03\",\n  \"match\": \"Bournemouth vs Fulham\",\n  \"homeTeam\": \"Bournemouth\",\n  \"awayTeam\": \"Fulham\",\n  \"league\": \"EPL\",\n  \"matchTime\": \"2025-10-03T19:00:00Z\",\n  \"homeOdds\": 1.95,\n  \"drawOdds\": 3.85,\n  \"awayOdds\": 4.5,\n  \"bookmakerCount\": 40\n}\n\n\nWhat the model should output (illustrative)\n\n{\n  \"matchId\": \"bournemouth_vs_fulham_2025-10-03\",\n  \"match\": \"Bournemouth vs Fulham\",\n  \"prediction\": \"home\",\n  \"confidence\": 52,\n  \"expectedScore\": \"1-0\",\n  \"recommendedBet\": \"Home Win\",\n  \"stake\": 1,\n  \"riskLevel\": 5,\n  \"expectedValue\": 0.5,\n  \"keyFactors\": [\n    \"Implied probabilities from best odds: Home ≈51.6%, Draw ≈26.1%, Away ≈22.3%\",\n    \"High market depth (40 bookmakers) reduces pricing noise\",\n    \"Odds-only model; no recent form or injuries considered\"\n  ],\n  \"alternativeBets\": [\n    \"Home or Draw (1X)\",\n    \"Draw No Bet (Home)\"\n  ],\n  \"warnings\": [\n    \"Small edge (EV ≤ 1%) — keep stake conservative\"\n  ]\n}\nAlso include in your JSON output the same homeOdds, drawOdds, awayOdds, bookmakerCount, and matchTime you received (unchanged), so downstream nodes don’t lose them.",
+        "options": {
+          "systemMessage": "You are an expert football betting analyst with 15+ years of experience in sports analytics, statistical modeling, and value betting. Your role is to analyze match data and provide precise, data-driven betting recommendations.ULTRATHINK \n\nYour analysis methodology:\n1. Evaluate team form and recent performance trends\n2. Assess head-to-head statistics and historical patterns  \n3. Calculate true probabilities vs bookmaker odds\n4. Identify value bets where true probability exceeds implied odds\n5. Apply Kelly Criterion for optimal stake sizing\n6. Consider contextual factors (injuries, motivation, venue)\n\nCRITICAL: You must ALWAYS respond with valid JSON format only. No explanations or text outside the JSON structure.\n\nYour response must be a valid JSON object with these exact fields:\n{\n  \"matchId\": \"string\",\n  \"match\": \"Team A vs Team B\",\n  \"prediction\": \"home\" or \"draw\" or \"away\",\n  \"confidence\": number between 0-100,\n  \"expectedScore\": \"X-X format\",\n  \"recommendedBet\": \"specific bet type and selection\",\n  \"stake\": number between 1-5,\n  \"riskLevel\": number between 1-10,\n  \"expectedValue\": number (positive or negative percentage),\n  \"keyFactors\": [\"factor1\", \"factor2\", \"factor3\"],\n  \"alternativeBets\": [\"bet option 1\", \"bet option 2\"],\n  \"warnings\": [\"any risk factors or concerns\"]\n}\n\nStake sizing rules:\n- 1 unit: Low confidence (60-65%), high risk\n- 2 units: Moderate confidence (66-70%), moderate risk  \n- 3 units: Good confidence (71-75%), controlled risk\n- 4 units: High confidence (76-80%), low risk\n- 5 units: Maximum confidence (81%+), minimal risk\n\nValue bet criteria:\n- Expected Value > 5% = Strong value bet\n- Expected Value 3-5% = Moderate value bet\n- Expected Value 0-3% = Marginal value\n- Expected Value < 0% = No value (avoid)"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        528
+      ],
+      "id": "8713633e-1951-4a58-8c37-8760f45bde67",
+      "name": "Expert Betting Agent1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------- Helpers ----------\nconst toNum = (v, d = 0) => {\n  const n = Number(v);\n  return Number.isFinite(n) ? n : d;\n};\n\nconst fmtPercent = (n) => {\n  const x = Number(n);\n  if (!Number.isFinite(x)) return '0.0%';\n  const sign = x > 0 ? '+' : x < 0 ? '' : '';\n  return `${sign}${x.toFixed(1)}%`;\n};\n\nconst riskLabel = (lvl) => {\n  const n = Number(lvl);\n  if (n <= 3) return 'Low';\n  if (n <= 6) return 'Medium';\n  if (n <= 8) return 'Elevated';\n  return 'High';\n};\n\nconst formatUKTime = (iso) => {\n  if (!iso) return 'TBD';\n  try {\n    return new Date(iso).toLocaleString('en-GB', {\n      timeZone: 'Europe/London',\n      day: '2-digit', month: 'short', year: 'numeric',\n      hour: '2-digit', minute: '2-digit', hour12: false,\n    });\n  } catch { return 'TBD'; }\n};\n\nconst extractJson = (text) => {\n  if (typeof text !== 'string') return null;\n  // handle ```json ... ``` or ``` ... ```\n  const fenced = text.match(/```json\\s*([\\s\\S]*?)```/i) || text.match(/```\\s*([\\s\\S]*?)```/);\n  const body = fenced ? fenced[1] : text;\n  const jsonOnly = body.match(/\\{[\\s\\S]*\\}/);\n  if (!jsonOnly) return null;\n  try { return JSON.parse(jsonOnly[0]); } catch { return null; }\n};\n\nconst first = (...vals) => {\n  for (const v of vals) {\n    if (v !== undefined && v !== null) return v;\n  }\n  return null;\n};\n\n// ---------- Main ----------\nconst items = $input.all();\nconst out = [];\n\nfor (const item of items) {\n  try {\n    // 1) Pull agent output (string or object)\n    const aiResponse =\n      item.json?.message?.content ??\n      item.json?.response ??\n      item.json?.output ??\n      '';\n\n    const analysis = (aiResponse && typeof aiResponse === 'object')\n      ? aiResponse\n      : (extractJson(aiResponse) || {});\n\n    // 2) Pull original match data if present (works when you Merge the original with Agent output)\n    const matchData = {\n      ...(item.json || {}),\n      ...(item.json?.original || {}),\n      ...(item.json?.input || {}),\n    };\n\n    // 3) Build base tip using analysis first where applicable, with safe fallbacks to matchData\n    const tip = {\n      matchId: analysis.matchId || matchData.matchId || 'unknown',\n      match: (analysis.match && String(analysis.match)) ||\n             (matchData.homeTeam && matchData.awayTeam\n               ? `${matchData.homeTeam} vs ${matchData.awayTeam}`\n               : 'unknown match'),\n      league: matchData.league,\n\n      // prefer original kickoff; fallback to agent echo if provided\n      matchTime: first(matchData.matchTime, analysis.matchTime),\n\n      prediction: analysis.prediction || 'no prediction',\n      confidence: toNum(analysis.confidence, 0),\n      expectedScore: analysis.expectedScore || 'N/A',\n\n      recommendedBet: analysis.recommendedBet || 'No bet',\n      stake: toNum(analysis.stake, 0),\n      riskLevel: toNum(analysis.riskLevel, 5),\n\n      expectedValue: toNum(analysis.expectedValue, 0),\n\n      // Odds: prefer original fields, else agent echo\n      odds: {\n        home: first(matchData.homeOdds, matchData.odds?.home, analysis.homeOdds),\n        draw: first(matchData.drawOdds, matchData.odds?.draw, analysis.drawOdds),\n        away: first(matchData.awayOdds, matchData.odds?.away, analysis.awayOdds),\n      },\n\n      keyFactors: Array.isArray(analysis.keyFactors) ? analysis.keyFactors : [],\n      alternativeBets: Array.isArray(analysis.alternativeBets) ? analysis.alternativeBets : [],\n      warnings: Array.isArray(analysis.warnings) ? analysis.warnings : [],\n\n      timestamp: new Date().toISOString(),\n\n      // Bookmakers: prefer original count, else agent echo, else 0\n      bookmakers: first(\n        (typeof matchData.bookmakerCount === 'number') ? matchData.bookmakerCount : null,\n        (typeof analysis.bookmakerCount === 'number') ? analysis.bookmakerCount : null,\n        Array.isArray(matchData.bookmakers) ? matchData.bookmakers.length : null,\n        0\n      ),\n\n      // Value bet flag (your existing rule)\n      isValueBet: false,\n\n      // Preformatted display (no confidence bar)\n      display: {}\n    };\n\n    // 4) Compute value flag\n    tip.isValueBet = tip.confidence >= 65 && tip.expectedValue > 5;\n\n    // 5) Display bundle for Telegram\n    tip.display = {\n      predictionUpper: tip.prediction ? String(tip.prediction).toUpperCase() : 'N/A',\n      matchTimeFormatted: formatUKTime(tip.matchTime),\n      oddsLine: `Home: ${tip.odds.home ?? 'N/A'} | Draw: ${tip.odds.draw ?? 'N/A'} | Away: ${tip.odds.away ?? 'N/A'}`,\n      expectedValuePct: fmtPercent(tip.expectedValue),\n      riskLabel: riskLabel(tip.riskLevel),\n    };\n\n    out.push({ json: tip });\n\n  } catch (err) {\n    out.push({\n      json: {\n        matchId: 'error',\n        match: 'Processing Error',\n        prediction: 'no prediction',\n        confidence: 0,\n        expectedScore: 'N/A',\n        recommendedBet: 'No bet',\n        stake: 0,\n        riskLevel: 5,\n        expectedValue: 0,\n        odds: { home: null, draw: null, away: null },\n        keyFactors: [],\n        alternativeBets: [],\n        warnings: [String(err?.message || err)],\n        timestamp: new Date().toISOString(),\n        bookmakers: 0,\n        isValueBet: false,\n        display: {\n          predictionUpper: 'N/A',\n          matchTimeFormatted: 'TBD',\n          oddsLine: 'Home: N/A | Draw: N/A | Away: N/A',\n          expectedValuePct: fmtPercent(0),\n          riskLabel: riskLabel(5),\n        },\n      },\n    });\n  }\n}\n\nreturn out;\n"
+      },
+      "id": "dd447d87-a213-491c-94b9-adca71d9ac88",
+      "name": "Format Betting Tips1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.confidence }}",
+              "operation": "largerEqual",
+              "value2": 65
+            },
+            {
+              "value1": "={{ $json.expectedValue }}",
+              "operation": "larger",
+              "value2": 5
+            }
+          ],
+          "boolean": [
+            {
+              "value1": "={{ $json.isValueBet }}"
+            }
+          ]
+        },
+        "combineOperation": "any"
+      },
+      "id": "1bc562ab-5978-4519-98ff-9b9a54acf4df",
+      "name": "Filter Value Bets1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1488,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [
+        1008,
+        688
+      ],
+      "id": "9704539c-2184-42cc-acf5-6a4f588a724e",
+      "name": "OpenRouter Chat Model1",
+      "credentials": {
+        "openRouterApi": {
+          "id": "3EDpqw8CK3lbjkFr",
+          "name": "OpenRouter account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.homeTeam }}",
+        "contextWindowLength": 10
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        1168,
+        704
+      ],
+      "id": "ecd3c021-c5ca-4da8-824c-b6c399cb3060",
+      "name": "Simple Memory1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Start Here - Manual Test": {
+      "main": [
+        [
+          {
+            "node": "Get Betting Odds",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Match Statistics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule - Every 6 Hours": {
+      "main": [
+        [
+          {
+            "node": "Get Betting Odds",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Match Statistics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Betting Odds": {
+      "main": [
+        [
+          {
+            "node": "Map Odds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Match Statistics": {
+      "main": [
+        [
+          {
+            "node": "Merge Data Sources",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Data Sources": {
+      "main": [
+        [
+          {
+            "node": "Process All Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process All Data": {
+      "main": [
+        [
+          {
+            "node": "Expert Betting Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Expert Betting Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Betting Tips": {
+      "main": [
+        [
+          {
+            "node": "Filter Value Bets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Value Bets": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "Expert Betting Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expert Betting Agent": {
+      "main": [
+        [
+          {
+            "node": "Format Betting Tips",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Odds": {
+      "main": [
+        [
+          {
+            "node": "Merge Data Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Expert Betting Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Telegram Alert": {
+      "main": [
+        []
+      ]
+    },
+    "Expert Betting Agent1": {
+      "main": [
+        [
+          {
+            "node": "Format Betting Tips1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Betting Tips1": {
+      "main": [
+        [
+          {
+            "node": "Filter Value Bets1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Value Bets1": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Expert Betting Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory1": {
+      "ai_memory": [
+        [
+          {
+            "node": "Expert Betting Agent1",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "07d9a921-6bec-4870-8460-76ae435e6cf5",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "50517deb911fc5e26901259921b4a2c196c4b6f5bad009cab42f49ce6899da55"
+  },
+  "id": "HnC5GjBRPADKaieA",
+  "tags": []
+}
