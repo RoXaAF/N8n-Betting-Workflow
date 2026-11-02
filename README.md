@@ -1,4 +1,6 @@
-# N8n Betting Workflow
+# N8n Betting Workflow 
+
+![Image Alt](https://user-images.githubusercontent.com/10284570/173569848-c624317f-42b1-45a6-ab09-f0ea3c247648.png)
 
 Automated football odds scanner that uses an LLM to post value-bet tips to Telegram and Discord.
 
